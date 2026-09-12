@@ -1,6 +1,6 @@
 {
-  "name": "Thread — pick up where you left off",
-  "short_name": "Thread",
+  "name": "JaldiRewind — pick up where you left off",
+  "short_name": "JaldiRewind",
   "description": "Catch your train of thought before an interruption, and pick it back up in seconds.",
   "start_url": "./index.html",
   "scope": "./",
