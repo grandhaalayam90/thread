@@ -13,17 +13,29 @@ firebase.initializeApp({
 
 const messaging = firebase.messaging();
 
+// Backend sends data-only messages, so we show the notification ourselves (no duplicates)
 messaging.onBackgroundMessage((payload) => {
-  const title = (payload.notification && payload.notification.title) || 'JaldiRewind';
-  const body = (payload.notification && payload.notification.body) || 'You have something waiting.';
-  self.registration.showNotification(title, {
-    body,
-    icon: './icon-192.png'
+  const d = payload.data || {};
+  self.registration.showNotification(d.title || 'JaldiRewind', {
+    body: d.body || 'You have something waiting.',
+    icon: './icon-192.png',
+    data: { url: d.url || './' }
   });
 });
 
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || './';
+  e.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      for(const c of list){ if('focus' in c) return c.focus(); }
+      return clients.openWindow(url);
+    })
+  );
+});
+
 // --- Offline caching (unchanged from before) ---
-const CACHE_NAME = 'jaldirewind-v7';
+const CACHE_NAME = 'jaldirewind-v8';
 const ASSETS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
