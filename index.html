@@ -148,6 +148,26 @@
   }
   .capture-box button:active{ transform: scale(0.9); }
   .capture-box button svg{ width:18px; height:18px; }
+  .remind-row{
+    display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+    margin-top:12px;
+  }
+  .remind-label{ font-size:12px; color:#8C8A7C; margin-right:2px; }
+  .chip{
+    border:1px solid #3A3C48; background:transparent; color:#A9A79A;
+    font-family:'IBM Plex Sans',sans-serif; font-size:12px; font-weight:500;
+    padding:5px 11px; border-radius:999px; cursor:pointer;
+  }
+  .chip.active{ background:var(--gold-soft); border-color:var(--gold); color:var(--gold); }
+  .custom-row{
+    display:none; align-items:center; gap:8px; margin-top:8px;
+    font-size:12.5px; color:#A9A79A;
+  }
+  .custom-row input{
+    width:90px; background:var(--ink-soft); border:1px solid #3A3C48; color:var(--text-light);
+    border-radius:10px; padding:6px 10px; font-size:14px; font-family:'IBM Plex Sans',sans-serif;
+  }
+  .thread-remind{ font-size:12px; color:var(--text-mute); margin-top:6px; }
   .capture-hint{
     margin-top: 10px;
     font-size: 12.5px;
@@ -276,6 +296,21 @@
         <svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#191B24" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </div>
+    <div class="remind-row" id="remindRow">
+      <span class="remind-label">Remind me in</span>
+      <button class="chip" data-mins="5">5 min</button>
+      <button class="chip" data-mins="10">10 min</button>
+      <button class="chip" data-mins="30">30 min</button>
+      <button class="chip" data-mins="60">1 hr</button>
+      <button class="chip" data-mins="180">3 hr</button>
+      <button class="chip" data-mins="1440">1 day</button>
+      <button class="chip" data-mins="custom">Custom</button>
+      <button class="chip" data-mins="off">Off</button>
+    </div>
+    <div class="custom-row" id="customRow">
+      <input type="number" id="customMins" min="1" max="10080" inputmode="numeric" placeholder="e.g. 45">
+      <span>minutes</span>
+    </div>
     <div class="capture-hint" id="captureHint">Your keyboard's mic icon dictates hands-free — no app permissions needed.</div>
   </div>
 
@@ -297,6 +332,34 @@
   const captureHint = document.getElementById('captureHint');
   const pillThread = document.getElementById('pillThread');
   const pillDecision = document.getElementById('pillDecision');
+  const remindRow = document.getElementById('remindRow');
+  const customRow = document.getElementById('customRow');
+  const customMins = document.getElementById('customMins');
+
+  // Reminder choice (minutes, 'custom' or 'off'); remembered between visits
+  let remindChoice = '30';
+  try{ remindChoice = localStorage.getItem('remind_choice') || '30'; }catch(e){}
+  function paintChips(){
+    remindRow.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c.dataset.mins === remindChoice));
+    customRow.style.display = remindChoice === 'custom' ? 'flex' : 'none';
+  }
+  remindRow.addEventListener('click', (e) => {
+    const b = e.target.closest('.chip');
+    if(!b) return;
+    remindChoice = b.dataset.mins;
+    try{ localStorage.setItem('remind_choice', remindChoice); }catch(_){}
+    paintChips();
+    if(remindChoice === 'custom') customMins.focus();
+  });
+  paintChips();
+
+  // -1 = no reminder, otherwise the time (ms) the reminder is due
+  function computeRemindAt(){
+    if(remindChoice === 'off') return -1;
+    let mins = remindChoice === 'custom' ? parseInt(customMins.value, 10) : parseInt(remindChoice, 10);
+    if(!mins || mins < 1) mins = 30;
+    return Date.now() + mins * 60000;
+  }
 
   const HINTS = {
     thread: "Your keyboard's mic icon dictates hands-free — no app permissions needed.",
@@ -319,6 +382,22 @@
     let cue = t.split(/[.;]\s|\s—\s/)[0];
     if(cue.length > 58){ cue = cue.slice(0, 55).trim() + '…'; }
     return cue.charAt(0).toUpperCase() + cue.slice(1);
+  }
+
+  function formatWhen(ts){
+    const d = new Date(ts);
+    const t = d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+    return d.toDateString() === new Date().toDateString()
+      ? t
+      : d.toLocaleDateString([], { month:'short', day:'numeric' }) + ', ' + t;
+  }
+
+  function savedMessage(entry){
+    if(!entry || !(entry.remindAt > 0)) return entry && entry.remindAt < 0 ? 'Saved. No reminder set.' : 'Saved.';
+    if(!('Notification' in window) || Notification.permission !== 'granted'){
+      return 'Saved. Tap “Turn on reminders” at the top to get notified at ' + formatWhen(entry.remindAt) + '.';
+    }
+    return 'Saved. Reminder at ' + formatWhen(entry.remindAt) + '.';
   }
 
   function timeAgo(ts){
@@ -376,7 +455,8 @@
       note: rawText.trim(),
       cue: makeCue(rawText),
       time: Date.now(),
-      done: false
+      done: false,
+      remindAt: computeRemindAt()
     });
     saveThreads();
     render();
@@ -424,11 +504,16 @@
         : (th.done ? 'Reopen' : 'Decided');
       const removeLabel = type === 'thread' ? 'Remove' : 'Let it go';
       const timeText = isAged ? `Sitting ${timeAgo(th.time)}` : timeAgo(th.time);
+      let remindLine = '';
+      if(!th.done && th.remindAt > 0){
+        remindLine = `<div class="thread-remind">⏰ ${th.remindAt > Date.now() ? 'Reminder at' : 'Reminder was due'} ${formatWhen(th.remindAt)}</div>`;
+      }
       card.innerHTML = `
         <div class="thread-top">
           <p class="thread-cue">${escapeHtml(th.cue)}</p>
           <div class="thread-time">${timeText}</div>
         </div>
+        ${remindLine}
         <div class="thread-note">${escapeHtml(th.note)}</div>
         <div class="thread-actions">
           <button class="btn-done">${doneLabel}</button>
@@ -462,7 +547,7 @@
     if(!val || !val.trim()) return;
     addThread(val, activeType);
     typeArea.value = '';
-    captureHint.textContent = 'Saved.';
+    captureHint.textContent = savedMessage(entries[0]);
     captureHint.classList.add('saved-flash');
     setTimeout(() => {
       captureHint.textContent = HINTS[activeType];
@@ -501,32 +586,35 @@
     });
   }
 
-  // --- Reminder notifications (fires when the app is opened, for anything aged) ---
-  function checkAgedAndNotify(){
-    if(!('Notification' in window)) return;
-
-    const agedDecisions = entries.filter(e => e.type === 'decision' && !e.done && (Date.now() - e.time) > AGE_NUDGE_MS);
-    const agedThreads = entries.filter(e => e.type === 'thread' && !e.done && (Date.now() - e.time) > AGE_NUDGE_MS);
-    const totalAged = agedDecisions.length + agedThreads.length;
-    if(totalAged === 0) return;
-
-    const fire = () => {
-      let body;
-      if(agedDecisions.length && agedThreads.length){
-        body = `${agedDecisions.length} decision${agedDecisions.length>1?'s':''} and ${agedThreads.length} thread${agedThreads.length>1?'s':''} are still waiting on you.`;
-      } else if(agedDecisions.length){
-        body = `${agedDecisions.length} decision${agedDecisions.length>1?'s':''} you've been putting off. Decide, or let it go.`;
-      } else {
-        body = `${agedThreads.length} thread${agedThreads.length>1?'s':''} you never picked back up.`;
-      }
-      try{ new Notification('JaldiRewind', { body, icon: 'icon-192.png' }); }catch(e){}
-    };
-
-    if(Notification.permission === 'granted'){
-      fire();
+  // --- Local notifications (used only when push isn't set up on this device) ---
+  function showNote(title, body){
+    if(!('Notification' in window) || Notification.permission !== 'granted') return;
+    const opts = { body: body, icon: 'icon-192.png' };
+    if('serviceWorker' in navigator){
+      navigator.serviceWorker.ready
+        .then(reg => reg.showNotification(title, opts))
+        .catch(() => { try{ new Notification(title, opts); }catch(e){} });
+    } else {
+      try{ new Notification(title, opts); }catch(e){}
     }
-    // if permission hasn't been decided yet, we ask via the button in the UI instead of
-    // prompting automatically — unsolicited permission prompts get auto-denied by browsers
+  }
+
+  function checkAgedAndNotify(){
+    if(!('Notification' in window) || Notification.permission !== 'granted') return;
+    if(localStorage.getItem('fcm_token')) return; // server push handles reminders
+    const now = Date.now();
+    const items = entries.filter(e => !e.done && !e.localNotified && (
+      (e.remindAt > 0 && e.remindAt <= now) ||
+      (!e.remindAt && (now - e.time) > AGE_NUDGE_MS)
+    ));
+    if(!items.length) return;
+    if(items.length === 1){
+      showNote(items[0].type === 'decision' ? 'Decision waiting' : 'Pick it back up', items[0].cue);
+    } else {
+      showNote('JaldiRewind', items.length + ' things are waiting on you.');
+    }
+    items.forEach(e => { e.localNotified = true; });
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(entries)); }catch(e){}
   }
 
   // --- Firebase Cloud Messaging: lets JaldiRewind receive a push even when fully closed ---
@@ -558,9 +646,8 @@
       syncToBackend();
       // Foreground messages (app open in a visible tab) show as a native notification too
       messaging.onMessage((payload) => {
-        const title = (payload.notification && payload.notification.title) || 'JaldiRewind';
-        const body = (payload.notification && payload.notification.body) || '';
-        try{ new Notification(title, { body, icon: 'icon-192.png' }); }catch(e){}
+        const d = payload.data || payload.notification || {};
+        showNote(d.title || 'JaldiRewind', d.body || '');
       });
       return { ok:true, token };
     }catch(err){
