@@ -64,6 +64,45 @@
     color: #A9A79A;
     max-width: 34ch;
   }
+  .notif-btn{
+    margin-top: 14px;
+    background: var(--ink-soft);
+    border: 1px solid #3A3C48;
+    color: var(--text-light);
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 8px 14px;
+    border-radius: 999px;
+    cursor:pointer;
+  }
+  .notif-btn:disabled{
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  /* Type toggle */
+  .type-toggle{
+    display:flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .type-pill{
+    border: 1px solid #3A3C48;
+    background: transparent;
+    color: #A9A79A;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 6px 14px;
+    border-radius: 999px;
+    cursor:pointer;
+  }
+  .type-pill.active{
+    background: var(--gold-soft);
+    border-color: var(--gold);
+    color: var(--gold);
+  }
 
   /* Capture box */
   .capture{
@@ -188,6 +227,14 @@
   .btn-done{ color: var(--pine); }
   .btn-remove{ color: var(--text-mute); }
 
+  .thread-card.aged{
+    border-left-color: var(--danger);
+  }
+  .thread-card.aged .thread-time{
+    color: var(--danger);
+    font-weight: 600;
+  }
+
   .empty{
     text-align:center;
     padding: 30px 10px;
@@ -207,45 +254,68 @@
     line-height:1.5;
   }
 </style>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
 </head>
 <body>
 <div class="app">
   <header>
     <h1>JaldiRewind</h1>
     <p>Getting pulled away? Say where your head's at. Come back and pick it right back up.</p>
+    <button id="enableNotifs" class="notif-btn">🔔 Turn on reminders</button>
   </header>
 
   <div class="capture">
+    <div class="type-toggle">
+      <button class="type-pill active" id="pillThread" data-type="thread">Thread</button>
+      <button class="type-pill" id="pillDecision" data-type="decision">Decision</button>
+    </div>
     <div class="capture-box">
       <textarea id="typeArea" placeholder="Tap here, then tap the mic on your keyboard and just talk…" rows="2"></textarea>
       <button id="typeSave" aria-label="Save thread">
         <svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#191B24" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </div>
-    <div class="capture-hint">Your keyboard's mic icon dictates hands-free — no app permissions needed.</div>
+    <div class="capture-hint" id="captureHint">Your keyboard's mic icon dictates hands-free — no app permissions needed.</div>
   </div>
 
-  <div class="section-label" id="listLabel">Open threads</div>
+  <div class="section-label" id="threadLabel">Open threads</div>
   <div class="threads" id="threadList"></div>
+
+  <div class="section-label" id="decisionLabel" style="margin-top:26px;">Decisions pending</div>
+  <div class="threads" id="decisionList"></div>
 </div>
 
 <script>
 (function(){
   const threadList = document.getElementById('threadList');
-  const listLabel = document.getElementById('listLabel');
+  const decisionList = document.getElementById('decisionList');
+  const threadLabel = document.getElementById('threadLabel');
+  const decisionLabel = document.getElementById('decisionLabel');
   const typeArea = document.getElementById('typeArea');
   const typeSave = document.getElementById('typeSave');
-  const captureHint = document.querySelector('.capture-hint');
-  const defaultHint = captureHint.textContent;
+  const captureHint = document.getElementById('captureHint');
+  const pillThread = document.getElementById('pillThread');
+  const pillDecision = document.getElementById('pillDecision');
+
+  const HINTS = {
+    thread: "Your keyboard's mic icon dictates hands-free — no app permissions needed.",
+    decision: "Log a choice you're putting off. We'll nudge you if it sits too long."
+  };
+  const PLACEHOLDERS = {
+    thread: "Tap here, then tap the mic on your keyboard and just talk…",
+    decision: "e.g. Cancel the gym membership or keep it?"
+  };
 
   const STORAGE_KEY = 'threads';
-  let threads = [];
+  let entries = [];
+  let activeType = 'thread';
   const FILLERS = /\b(um+|uh+|like|so basically|basically|you know|kind of|sort of|actually|just)\b/gi;
+  const AGE_NUDGE_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
 
   function makeCue(raw){
     let t = raw.trim().replace(FILLERS, ' ').replace(/\s+/g, ' ').trim();
-    if(!t) return 'Untitled thread';
-    // take up through first strong clause break, cap length
+    if(!t) return 'Untitled';
     let cue = t.split(/[.;]\s|\s—\s/)[0];
     if(cue.length > 58){ cue = cue.slice(0, 55).trim() + '…'; }
     return cue.charAt(0).toUpperCase() + cue.slice(1);
@@ -262,23 +332,47 @@
   async function loadThreads(){
     try{
       const raw = localStorage.getItem(STORAGE_KEY);
-      threads = raw ? JSON.parse(raw) : [];
+      entries = raw ? JSON.parse(raw) : [];
+      // backfill type for anything saved before this feature existed
+      entries.forEach(e => { if(!e.type) e.type = 'thread'; });
     }catch(e){
-      threads = [];
+      entries = [];
     }
     render();
   }
 
   async function saveThreads(){
     try{
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(threads));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
     }catch(e){ console.error('save failed', e); }
+    syncToBackend();
   }
 
-  function addThread(rawText){
+  // --- Sync entries + push token to the Apps Script backend (debounced) ---
+  // PASTE YOUR DEPLOYED APPS SCRIPT WEB APP URL BELOW, between the quotes.
+  // Leave it empty to skip syncing (app still works fully offline/locally without it).
+  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyvYQkmlW8rGL_lg3oNvTECNaHVz_wiq0c4C7Xe8ATDdrFS7Aph6SwTTspyHkYtuKcD/exec";
+
+  let syncTimer = null;
+  function syncToBackend(){
+    if(!APPS_SCRIPT_URL) return;
+    const token = fcmToken || localStorage.getItem('fcm_token');
+    if(!token) return; // nothing to notify without a push token
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => {
+      fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' }, // avoids a CORS preflight to Apps Script
+        body: JSON.stringify({ token, entries })
+      }).catch(err => console.error('sync failed', err));
+    }, 1500);
+  }
+
+  function addThread(rawText, type){
     if(!rawText || !rawText.trim()) return;
-    threads.unshift({
+    entries.unshift({
       id: 't' + Date.now(),
+      type: type,
       note: rawText.trim(),
       cue: makeCue(rawText),
       time: Date.now(),
@@ -289,42 +383,56 @@
   }
 
   function toggleDone(id){
-    const th = threads.find(t => t.id === id);
+    const th = entries.find(t => t.id === id);
     if(th) th.done = !th.done;
     saveThreads();
     render();
   }
 
   function removeThread(id){
-    threads = threads.filter(t => t.id !== id);
+    entries = entries.filter(t => t.id !== id);
     saveThreads();
     render();
   }
 
-  function render(){
-    threadList.innerHTML = '';
-    const open = threads.filter(t => !t.done);
-    const done = threads.filter(t => t.done);
-    listLabel.textContent = open.length ? `Open thread${open.length>1?'s':''} (${open.length})` : 'Open threads';
+  function renderList(container, label, items, type){
+    container.innerHTML = '';
+    const open = items.filter(t => !t.done);
+    const done = items.filter(t => t.done);
 
-    if(threads.length === 0){
-      threadList.innerHTML = `<div class="empty"><strong>Nothing dropped yet</strong>When you get pulled away mid-task, tap the button and say where you were. It'll be waiting here.</div>`;
+    if(type === 'thread'){
+      label.textContent = open.length ? `Open thread${open.length>1?'s':''} (${open.length})` : 'Open threads';
+    } else {
+      label.textContent = open.length ? `Decision${open.length>1?'s':''} pending (${open.length})` : 'Decisions pending';
+    }
+
+    if(items.length === 0){
+      const emptyText = type === 'thread'
+        ? `<strong>Nothing dropped yet</strong>When you get pulled away mid-task, log it and it'll be waiting here.`
+        : `<strong>No decisions logged</strong>When you catch yourself putting off a small choice, log it here instead of carrying it around.`;
+      container.innerHTML = `<div class="empty">${emptyText}</div>`;
       return;
     }
 
     const ordered = [...open, ...done];
     ordered.forEach(th => {
+      const isAged = type === 'decision' && !th.done && (Date.now() - th.time) > AGE_NUDGE_MS;
       const card = document.createElement('div');
-      card.className = 'thread-card' + (th.done ? ' done' : '');
+      card.className = 'thread-card' + (th.done ? ' done' : '') + (isAged ? ' aged' : '');
+      const doneLabel = type === 'thread'
+        ? (th.done ? 'Reopen' : 'Picked back up')
+        : (th.done ? 'Reopen' : 'Decided');
+      const removeLabel = type === 'thread' ? 'Remove' : 'Let it go';
+      const timeText = isAged ? `Sitting ${timeAgo(th.time)}` : timeAgo(th.time);
       card.innerHTML = `
         <div class="thread-top">
           <p class="thread-cue">${escapeHtml(th.cue)}</p>
-          <div class="thread-time">${timeAgo(th.time)}</div>
+          <div class="thread-time">${timeText}</div>
         </div>
         <div class="thread-note">${escapeHtml(th.note)}</div>
         <div class="thread-actions">
-          <button class="btn-done">${th.done ? 'Reopen' : 'Picked back up'}</button>
-          <button class="btn-remove">Remove</button>
+          <button class="btn-done">${doneLabel}</button>
+          <button class="btn-remove">${removeLabel}</button>
         </div>
       `;
       card.querySelector('.thread-cue').addEventListener('click', () => {
@@ -332,8 +440,15 @@
       });
       card.querySelector('.btn-done').addEventListener('click', () => toggleDone(th.id));
       card.querySelector('.btn-remove').addEventListener('click', () => removeThread(th.id));
-      threadList.appendChild(card);
+      container.appendChild(card);
     });
+  }
+
+  function render(){
+    const threadItems = entries.filter(e => e.type === 'thread');
+    const decisionItems = entries.filter(e => e.type === 'decision');
+    renderList(threadList, threadLabel, threadItems, 'thread');
+    renderList(decisionList, decisionLabel, decisionItems, 'decision');
   }
 
   function escapeHtml(s){
@@ -345,15 +460,27 @@
   function saveFromBox(){
     const val = typeArea.value;
     if(!val || !val.trim()) return;
-    addThread(val);
+    addThread(val, activeType);
     typeArea.value = '';
     captureHint.textContent = 'Saved.';
     captureHint.classList.add('saved-flash');
     setTimeout(() => {
-      captureHint.textContent = defaultHint;
+      captureHint.textContent = HINTS[activeType];
       captureHint.classList.remove('saved-flash');
     }, 1400);
   }
+
+  function setActiveType(type){
+    activeType = type;
+    pillThread.classList.toggle('active', type === 'thread');
+    pillDecision.classList.toggle('active', type === 'decision');
+    typeArea.placeholder = PLACEHOLDERS[type];
+    captureHint.textContent = HINTS[type];
+    typeArea.focus();
+  }
+
+  pillThread.addEventListener('click', () => setActiveType('thread'));
+  pillDecision.addEventListener('click', () => setActiveType('decision'));
 
   typeSave.addEventListener('click', saveFromBox);
 
@@ -366,11 +493,112 @@
   });
 
   loadThreads();
+  checkAgedAndNotify();
 
   if('serviceWorker' in navigator){
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('sw.js').catch(() => {});
     });
+  }
+
+  // --- Reminder notifications (fires when the app is opened, for anything aged) ---
+  function checkAgedAndNotify(){
+    if(!('Notification' in window)) return;
+
+    const agedDecisions = entries.filter(e => e.type === 'decision' && !e.done && (Date.now() - e.time) > AGE_NUDGE_MS);
+    const agedThreads = entries.filter(e => e.type === 'thread' && !e.done && (Date.now() - e.time) > AGE_NUDGE_MS);
+    const totalAged = agedDecisions.length + agedThreads.length;
+    if(totalAged === 0) return;
+
+    const fire = () => {
+      let body;
+      if(agedDecisions.length && agedThreads.length){
+        body = `${agedDecisions.length} decision${agedDecisions.length>1?'s':''} and ${agedThreads.length} thread${agedThreads.length>1?'s':''} are still waiting on you.`;
+      } else if(agedDecisions.length){
+        body = `${agedDecisions.length} decision${agedDecisions.length>1?'s':''} you've been putting off. Decide, or let it go.`;
+      } else {
+        body = `${agedThreads.length} thread${agedThreads.length>1?'s':''} you never picked back up.`;
+      }
+      try{ new Notification('JaldiRewind', { body, icon: 'icon-192.png' }); }catch(e){}
+    };
+
+    if(Notification.permission === 'granted'){
+      fire();
+    }
+    // if permission hasn't been decided yet, we ask via the button in the UI instead of
+    // prompting automatically — unsolicited permission prompts get auto-denied by browsers
+  }
+
+  // --- Firebase Cloud Messaging: lets JaldiRewind receive a push even when fully closed ---
+  const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyAF-9YVymxHLztkG4dx1m35HpUx8UscdbE",
+    authDomain: "jaldirewind.firebaseapp.com",
+    projectId: "jaldirewind",
+    storageBucket: "jaldirewind.firebasestorage.app",
+    messagingSenderId: "237565993267",
+    appId: "1:237565993267:web:597677255f7e577d5cde46"
+  };
+  const VAPID_KEY = "BIGlC4-CXW8GwbrXf4tzlvm4bwJ7WIZYAcwBdjdtqAIaNWL09xwcqYKUZ-M-uzbjFza9QgTfWYy62HUnXPP3VoU";
+
+  let fcmToken = null;
+
+  async function registerForPush(){
+    if(!('serviceWorker' in navigator) || !firebase || !firebase.messaging){
+      return { ok:false, reason:'unsupported' };
+    }
+    try{
+      if(!firebase.apps.length){ firebase.initializeApp(FIREBASE_CONFIG); }
+      const swReg = await navigator.serviceWorker.register('sw.js');
+      await navigator.serviceWorker.ready;
+      const messaging = firebase.messaging();
+      const token = await messaging.getToken({ vapidKey: VAPID_KEY, serviceWorkerRegistration: swReg });
+      if(!token) return { ok:false, reason:'no-token' };
+      fcmToken = token;
+      localStorage.setItem('fcm_token', token);
+      syncToBackend();
+      // Foreground messages (app open in a visible tab) show as a native notification too
+      messaging.onMessage((payload) => {
+        const title = (payload.notification && payload.notification.title) || 'JaldiRewind';
+        const body = (payload.notification && payload.notification.body) || '';
+        try{ new Notification(title, { body, icon: 'icon-192.png' }); }catch(e){}
+      });
+      return { ok:true, token };
+    }catch(err){
+      console.error('FCM registration failed', err);
+      return { ok:false, reason:'error', err };
+    }
+  }
+
+  // Manual enable button, shown only if permission is still undecided
+  const enableBtn = document.getElementById('enableNotifs');
+  if(enableBtn){
+    if(!('Notification' in window) || Notification.permission !== 'default'){
+      enableBtn.style.display = 'none';
+    } else {
+      enableBtn.addEventListener('click', async () => {
+        const perm = await Notification.requestPermission();
+        if(perm === 'granted'){
+          enableBtn.textContent = 'Connecting…';
+          const result = await registerForPush();
+          if(result.ok){
+            enableBtn.textContent = 'Reminders on';
+            enableBtn.disabled = true;
+            checkAgedAndNotify();
+          } else {
+            enableBtn.textContent = 'Reminders on (local only)';
+            enableBtn.disabled = true;
+            checkAgedAndNotify();
+          }
+        } else {
+          enableBtn.textContent = 'Reminders blocked';
+        }
+      });
+    }
+  }
+
+  // If permission was already granted in a previous visit, silently (re)register for push
+  if('Notification' in window && Notification.permission === 'granted'){
+    registerForPush();
   }
 })();
 </script>
